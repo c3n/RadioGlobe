@@ -1,291 +1,181 @@
-#! /usr/bin/python3
+#!/usr/bin/python3 -u
+
+import display
+disp = display.Display()
+
 import re
+import os
+import json
 import time
+import queue
+import random
+import alsaaudio
 import threading
 import subprocess
+from threading import Thread
 
-from streaming import Streamer, set_volume
-import database
-from display import Display
-from positional_encoders import *
-from ui_manager import UI_Manager
-from rgb_led import RGB_LED
-from scheduler import Scheduler
+import rgb_led_proc
+import vlc
+import encoders
+import dial
+import button
+import geo
 
-AUDIO_SERVICE = "pulse"
+PLAY_TIMEOUT_LONG = 10
+PLAY_TIMEOUT_SHORT = 2
 VOLUME_INCREMENT = 5
 
-state = "start"
-volume_display = False
-volume = 95
-jog = 0
-last_jog = 0
-state_entry = True
-ui_manager = UI_Manager()
+class Calib(Thread):
+  def __init__(self):
+    Thread.__init__(self)
+    self.daemon=True
+    self.calib=self.load_calib()
+    self.last=dict(self.calib)
+    self.start()
 
-# This is used to increase the size of the area searched around the coords
-# For example, fuzziness 2, latitude 50 and longitude 0 will result in a
-# search square 48,1022 to 52,2 (with encoder resolution 1024)
-def Look_Around(latitude:int, longitude:int, fuzziness:int):
-  # Offset fuzziness, so 0 means only the given coords
-  fuzziness += 1
+  def load_calib(self):
+    try:
+      with open("calib.json") as f:
+        return json.load(f)
+    except:
+      return {"volume":50,"encoder_offsets":[0,0],"paused":True}
 
-  search_coords = []
-
-  # Work out how big the perimeter is for each layer out from the origin
-  ODD_NUMBERS = [((i * 2) + 1) for i in range(0, fuzziness)]
-
-  # With each 'layer' of fuzziness we need a starting point.  70% of people are right-eye dominant and
-  # the globe is likely to be below the user, so go down and left first then scan horizontally, moving up
-  for layer in range(0, fuzziness):
-    for y in range(0, ODD_NUMBERS[layer]):
-      for x in range(0, ODD_NUMBERS[layer]):
-        coord_x = (latitude + x - (ODD_NUMBERS[layer] // 2)) % ENCODER_RESOLUTION
-        coord_y = (longitude + y - (ODD_NUMBERS[layer] // 2)) % ENCODER_RESOLUTION
-        if [coord_x, coord_y] not in search_coords:
-          search_coords.append([coord_x, coord_y])
-
-  return search_coords
-
-def Back_To_Tuning():
-  global state
-  global state_entry
-
-  if state != "tuning":
-    state = "tuning"
-    state_entry = True
-
-def Clear_Volume_Display():
-  global volume_display
-
-  volume_display = False
-
-def Process_UI_Events():
-  global state
-  global state_entry
-  global volume
-  global volume_display
-  global jog
-  global ui_manager
-  global encoders_thread
-  global rgb_led
-
-  ui_events = []
-  ui_manager.update(ui_events)
-
-  for event in ui_events:
-    if event[0] == "Jog":
-      if event[1] == 1:
-        # Next station
-        jog += 1
-      elif event[1] == -1:
-        # Previous station
-        jog -= 1
-      print(jog)
-
-    elif event[0] == "Volume":
-      if event[1] == 1:
-        volume += VOLUME_INCREMENT
-        volume = set_volume(volume)
-        volume_display = True
-        scheduler.attach_timer(Clear_Volume_Display, 3)
-        rgb_led.set_static("BLUE", timeout_sec=0.5, restore_previous_on_timeout=True)
-        print(("Volume up: {}%").format(volume))
-      elif event[1] == -1:
-        if state == "shutdown_confirm":
-          Back_To_Tuning()
-        else:
-          volume -= VOLUME_INCREMENT
-          volume = set_volume(volume)
-          volume_display = True
-          scheduler.attach_timer(Clear_Volume_Display, 3)
-          rgb_led.set_static("BLUE", timeout_sec=0.5, restore_previous_on_timeout=True)
-          print(("Volume down: {}%").format(volume))
-
-    elif event[0] == "Random":
-      print("Toggle jog mode - not implemented")
-
-    elif event[0] == "Shutdown":
-      state = "shutdown_confirm"
-      state_entry = True
-
-    elif event[0] == "Calibrate":
-      # Zero the positional encoders
-      offsets = encoders_thread.zero()
-      database.Save_Calibration(offsets[0], offsets[1])
-      rgb_led.set_static("GREEN", timeout_sec=0.5, restore_previous_on_timeout=True)
-      print("Calibrated")
-      display_thread.message(
-        line_1="",
-        line_2="Calibrated!",
-        line_3="",
-        line_4="")
-      
+  def run(self):
+    while True:
       time.sleep(1)
+      if self.calib!=self.last:
+        calibnow=dict(self.calib)
+        time.sleep(5)
+        if calibnow==self.calib:
+          subprocess.call(["sudo","mount","-o","remount,rw","/"])
+          with open("calib.json.new","w") as f:
+            f.write(json.dumps(calibnow))
+          os.rename("calib.json.new", "calib.json")
+          subprocess.call(["sudo","mount","-o","remount,ro","/"])
+          self.last=calibnow
 
-    elif event[0] == "Confirm":
-      if state == "shutdown_confirm":
-        state = "shutdown"
-        state_entry= True
-      else:
-        pass
+def play():
+  if station==None or not current_stations:
+    print("cant play",station,len(current_stations))
+    return
+  leds.tuning()
+  vlcc.play(current_stations[station]["url"])
+  disp.set_station(current_stations[station]["name"],station+1,len(current_stations))
 
+def pause():
+  vlcc.stop()
+  leds.paused()
+  disp.pause()
 
-# PROGRAM START
-database.Load_Map()
-encoder_offsets = database.Load_Calibration()
+def set_volume():
+  mixer.setvolume(calib.calib["volume"])
+  disp.set_volume(calib.calib["volume"])
 
-# Positional encoders - used to select latitude and longitude
-encoders_thread = Positional_Encoders(2, "Encoders", encoder_offsets[0], encoder_offsets[1])
-encoders_thread.start()
+def change_station(param):
+  global station
+  if not current_stations:
+    return
+  leds.jogged(param)
+  station=(station+param)%len(current_stations)
+  leds.jogged(param)
+  play()
 
-display_thread = Display(3, "Display")
-display_thread.start()
+def on_left_jog(param):
+  change_station(param)
 
-rgb_led = RGB_LED(20, "RGB_LED")
-rgb_led.start()
-
-scheduler = Scheduler(50, "SCHEDULER")
-scheduler.start()
-
-set_volume(volume)
-
-while True:
-  if state == "start":
-    # Entry - setup state
-    if state_entry:
-      state_entry = False
-      display_thread.message(
-        line_1="Radio Globe",
-        line_2="Made for DesignSpark",
-        line_3="by Jude Pullen and",
-        line_4="Donald Robson, 2020")
-      scheduler.attach_timer(Back_To_Tuning, 3)
-
-  elif state == "tuning":
-    # Entry - setup state
-    if state_entry:
-      state_entry = False
-      rgb_led.set_blink("WHITE")
-      display_thread.clear()
-
-    # Normal operation
+def on_left_button(param):
+  if param=="key_down":
+    calib.calib["paused"]=not calib.calib["paused"]
+    if calib.calib["paused"]:
+      pause()
     else:
-      coordinates = encoders_thread.get_readings()
-      search_area = Look_Around(coordinates[0], coordinates[1], fuzziness=3)
-      location_name = ""
-      stations_list = []
-      url_list = []
+      play()
 
-      # Check the search area.  Saving the first location name encountered
-      # and all radio stations in the area, in order encountered
-      for ref in search_area:
-        index = database.index_map[ref[0]][ref[1]]
+def on_right_jog(param):
+  calib.calib["volume"]=min(100,max(0,calib.calib["volume"]+param*VOLUME_INCREMENT))
+  set_volume()
+  leds.volume(calib.calib["volume"])
 
-        if index != 0xFFFF:
-          encoders_thread.latch(coordinates[0], coordinates[1], stickiness=3)
-          state = "playing"
-          state_entry = True
-          location = database.Get_Location_By_Index(index)
-          if location_name == "":
-            location_name = location
+def on_right_button(param):
+  if param=="key_down_long":
+    leds.calibrate()
+    calib.calib["encoder_offsets"]=encoders.zero()
+    disp.message("Calibrated")
 
-          for station in database.stations_data[location]["urls"]:
-            stations_list.append(station["name"])
-            url_list.append(station["url"])
+def on_lat_lon_moved(param):
+  global station
+  if station!=None:
+    leds.tuning()
+    vlcc.stop()
+    station=None
+  dist_km,city,current_stations=stations.query(*param)
+  disp.set_location(*param)
+  disp.set_city(city)
+  disp.set_station(f"{dist_km}km away")
 
-      # Provide 'helper' coordinates
-      latitude = round((360 * coordinates[0] / ENCODER_RESOLUTION - 180), 2)
-      longitude = round((360 * coordinates[1] / ENCODER_RESOLUTION - 180), 2)
-
-      if volume_display:
-        volume_disp = volume
-      else:
-        volume_disp = 0
-
-      display_thread.update(latitude, longitude,
-                            "Tuning...", volume_disp, "", False)
-
-  elif state == "playing":
-    # Entry - setup
-    if state_entry:
-      state_entry = False
-      jog = 0
-      last_jog = 0
-      rgb_led.set_static("RED", timeout_sec=3.0)
-      streamer = None
-
-      # Get display coordinates - from file, so there's no jumping about
-      latitude = database.stations_data[location]["coords"]["n"]
-      longitude = database.stations_data[location]["coords"]["e"]
-
-      # Play the top station
-      streamer = Streamer(AUDIO_SERVICE, url_list[jog])
-      streamer.play()
-
-    # Exit back to tuning state if latch has 'come unstuck'
-    elif not encoders_thread.is_latched():
-      streamer.stop()
-      state = "tuning"
-      state_entry = True
-
-    # If the jog dial is used, stop the stream and restart with the new url
-    elif jog != last_jog:
-      # Restrict the jog dial value to the bounds of stations_list
-      jog %= len(stations_list)
-      last_jog = jog
-
-      streamer.stop()
-      streamer = Streamer(AUDIO_SERVICE, url_list[jog])
-      streamer.play()
-
-    # Idle operation - just keep display updated
-    else:
-      if volume_display:
-        volume_disp = volume
-      else:
-        volume_disp = 0
-
-      # Add arrows to the display if there is more than one station here
-      if len(stations_list) > 1:
-        display_thread.update(latitude, longitude, location_name, volume_disp, stations_list[jog], True)
-      elif len(stations_list) == 1:
-        display_thread.update(latitude, longitude, location_name, volume_disp, stations_list[jog], False)
-
-  elif state == "shutdown_confirm":
-    if state_entry:
-      state_entry = False
-      display_thread.clear()
-      time.sleep(0.1)
-      display_thread.message(
-        line_1="Really shut down?",
-        line_2="<- Press mid button ",
-        line_3="to confirm or",
-        line_4="<- bottom to cancel.")
-
-      # Auto-cancel in 5s
-      scheduler.attach_timer(Back_To_Tuning, 5)
-    
-  elif state == "shutdown":
-    if state_entry:
-      state_entry = False
-      display_thread.clear()
-      time.sleep(0.1)
-      display_thread.message(
-        line_1="Shutting down...",
-        line_2="Please wait 10 sec",
-        line_3="before disconnecting",
-        line_4="power.")
-      subprocess.run(["sudo", "poweroff"])
-
+def on_lat_lon_stuck(param):
+  global current_stations,first,station
+  dist_km,city,current_stations=stations.query(*param)
+  disp.set_location(*param)
+  if dist_km>1000:
+    disp.set_city(f"{city}: {dist_km}km")
+    disp.set_station("Too far away", 0, 0)
+  elif not current_stations:
+    disp.set_city(city)
+    disp.set_station("No Stations here", 0, 0)
   else:
-    # Just in case!
-    state = "tuning"
+    station=random.randint(0,len(current_stations)-1)
+    disp.set_city(city)
+    if first:
+      first=False
+      if calib.calib["paused"]:
+        print("start paused")
+        pause()
+      else:
+        print("start playing")
+        play()
+    else:
+      calib.calib["paused"]=False
+      play()
 
-  Process_UI_Events()
+def on_vlc(param):
+  if param=="playing":
+    leds.playing()
+  else:
+    if vlcc.play_start_at!=None:
+      trying_for=time.time()-vlcc.play_start_at
+      if param=="trying":
+        if trying_for>PLAY_TIMEOUT_LONG:
+          change_station(1)
+      elif param=="stopped":
+        if trying_for>PLAY_TIMEOUT_SHORT:
+          change_station(1)
 
-  # Avoid unnecessarily high polling
-  time.sleep(0.1)
+def handle_event(evt,param):
+  globals()[f"on_{evt}"](param)
 
-# Clean up threads
-encoders_thread.join()
+def loop():
+  disp.message("Started",1)
+  while True:
+    try:
+      evt=in_q.get(timeout=0.2)
+    except queue.Empty:
+      continue
+    handle_event(*evt)
+
+if __name__=="__main__":
+  first = True
+  station = None
+  current_stations = None
+  leds = rgb_led_proc.RGBLeds()
+  in_q = queue.Queue()
+  calib=Calib()
+  mixer=alsaaudio.Mixer()
+  dials = dial.Dials(in_q)
+  buttons = button.Buttons(in_q)
+  encoders = encoders.Encoders(in_q,calib.calib["encoder_offsets"])
+  vlcc=vlc.VLC(in_q)
+  stations=geo.Stations()
+  set_volume()
+  leds.tuning()
+  loop()

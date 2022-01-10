@@ -1,135 +1,124 @@
-#! /usr/bin/python3
+#!/usr/bin/python3
+
+import sys
+import math
 import time
-import threading
-import RPi.GPIO as GPIO
+from threading import Thread
+from rpi_ws281x import PixelStrip, Color
 
-RED_PIN = 22
-GREEN_PIN = 23
-BLUE_PIN = 24
+# LED strip configuration:
+LED_COUNT = 8         # Number of LED pixels.
+LED_PIN = 13          # GPIO pin connected to the pixels (18 uses PWM!).
+# LED_PIN = 10        # GPIO pin connected to the pixels (10 uses SPI /dev/spidev0.0).
+LED_FREQ_HZ = 800000  # LED signal frequency in hertz (usually 800khz)
+LED_DMA = 10          # DMA channel to use for generating signal (try 10)
+LED_BRIGHTNESS = 255  # Set to 0 for darkest and 255 for brightest
+LED_INVERT = False    # True to invert the signal (when using NPN transistor level shift)
+LED_CHANNEL = 1       # set to '1' for GPIOs 13, 19, 41, 45 or 53
 
-COLOURS = {
-  "OFF":      None,
-  "RED":      [RED_PIN],
-  "GREEN":    [GREEN_PIN],
-  "BLUE":     [BLUE_PIN],
-  "CYAN":     [GREEN_PIN,  BLUE_PIN],
-  "MAGENTA":  [RED_PIN,   BLUE_PIN],
-  "YELLOW":   [RED_PIN,   GREEN_PIN],
-  "WHITE":    [RED_PIN,   GREEN_PIN,  BLUE_PIN]
+COLORS={ #der vierte ist die animationsgeschwindigkeit
+  "off":[0,0,0],
+  "starting":[30,0,30,5],
+  "calibrate":[0,255,0],
+  "volume":[255,100,100],
+  "jogged":[60,60,255],
+  "tuning":[255,255,0,20],
+  "playing":[255,255,255,10],
+  "paused":[30,0,0,1]
 }
 
-class RGB_LED (threading.Thread):
-  def __init__(self, threadID, name):
-    threading.Thread.__init__(self)
-    self.threadID = threadID
-    self.name = name
+for v in COLORS.values():
+  v[:3]=[x//4 for x in v[:3]]
 
-    # BCM pin numbering!
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup([RED_PIN, GREEN_PIN, BLUE_PIN], direction=GPIO.OUT, initial=GPIO.HIGH)
+JOG_LIT=3
 
-    self.state = 1
-    self.colour_0 = "OFF"
-    self.colour_1 = "OFF"
-    self.colour_0_mem = None
-    self.colour_1_mem = None
-
-    self.timer = None
-
-  def __del__(self):
-    GPIO.cleanup()
-
-  def set_static(self, colour:str=None, timeout_sec:float=None, restore_previous_on_timeout:bool=False):
-    if timeout_sec:
-      if self.timer:
-        return
-
-      self.timer = timeout_sec + 0.5
-      if restore_previous_on_timeout:
-        self.colour_0_mem = self.colour_0
-        self.colour_1_mem = self.colour_1
-      else:
-        self.colour_0_mem = None
-        self.colour_1_mem = None
-
-    self.colour_0 = colour
-    self.colour_1 = colour
-
-    pins = COLOURS[colour]
-
-    # All pins off (perhaps momentarily)
-    GPIO.output([RED_PIN, GREEN_PIN, BLUE_PIN], GPIO.LOW)
-
-    # Write required pins high
-    if pins != None:
-      GPIO.output(pins, GPIO.HIGH)
-
-  def set_blink(self, colour_0:str=None, colour_1:str="OFF", timeout_sec:float=None, restore_previous_on_timeout:bool=False):
-    if timeout_sec:
-      if self.timer:
-        return
-
-      self.timer = timeout_sec + 0.5
-      if restore_previous_on_timeout:
-        self.colour_0_mem = self.colour_0
-        self.colour_1_mem = self.colour_1
-      else:
-        self.colour_0_mem = None
-        self.colour_1_mem = None
-
-    self.colour_0 = colour_0
-    self.colour_1 = colour_1
+class RGBLeds(Thread):
+  def __init__(self):
+    Thread.__init__(self)
+    self.daemon = True
+    self.strip = PixelStrip(LED_COUNT, LED_PIN, LED_FREQ_HZ, LED_DMA, LED_INVERT, LED_BRIGHTNESS, LED_CHANNEL)
+    self.strip.begin()
+    self.state="starting"
+    self.jog=None
+    self.vol=None
+    self.calibrated=None
+    self.start()
 
   def run(self):
     while True:
-      if self.state == 0:
-        self.state = 1
-        pins = COLOURS[self.colour_1]
+      while self.vol!=None:
+        nowvol=self.vol
+        self.vol=None
+        midled=int(nowvol*LED_COUNT/100)
+        for i in range(LED_COUNT):
+          j=LED_COUNT-1-i
+          if i<midled:
+            self.strip.setPixelColorRGB(j,*COLORS["volume"])
+          elif i>midled:
+            self.strip.setPixelColorRGB(j,*COLORS["off"])
+          else:
+            f=(nowvol/100-midled/LED_COUNT)*LED_COUNT
+            self.strip.setPixelColorRGB(j,*[int(x*f) for x in COLORS["volume"]])
+        self.strip.show()
+        for i in range(30):
+          if self.vol!=None:
+            break
+          time.sleep(0.1)
+      if self.jog!=None:
+        for j in range(LED_COUNT+JOG_LIT-1) if self.jog<0 else range(LED_COUNT+JOG_LIT-2,-1,-1):
+          for i in range(LED_COUNT):
+            self.strip.setPixelColorRGB(i,*COLORS["jogged" if j-JOG_LIT<i<=j else "off"])
+          self.strip.show()             
+          time.sleep(0.05)
+        self.jog=None
+      elif self.calibrated:
+        for i in range(3):
+          for i in range(LED_COUNT):
+            self.strip.setPixelColorRGB(i,*COLORS["calibrate"])
+          self.strip.show()
+          time.sleep(0.2)
+          for i in range(LED_COUNT):
+            self.strip.setPixelColorRGB(i,*COLORS["off"])
+          self.strip.show()
+          time.sleep(0.5)
+        self.calibrated=None
       else:
-        self.state = 0
-        pins = COLOURS[self.colour_0]
+        col=COLORS[self.state]
+        if len(col)>3:
+          n=time.time()*col[3]
+          for i in range(LED_COUNT):
+            self.strip.setPixelColorRGB(i,*[int(x*(math.sin(n+i*6/LED_COUNT)/3+0.66)) for x in col[:3]])
+        else:
+          for i in range(LED_COUNT):
+              self.strip.setPixelColorRGB(i,*col)
+        self.strip.show()
+        time.sleep(0.05)
+  
+  def volume(self,volume):
+    self.vol=volume
 
-      # All pins off (perhaps momentarily)
-      GPIO.output([RED_PIN, GREEN_PIN, BLUE_PIN], GPIO.LOW)
+  def jogged(self,direction):
+    self.jog=direction
 
-      # Write required pins high
-      if pins != None:
-        GPIO.output(pins, GPIO.HIGH)
+  def calibrate(self):
+    self.calibrated=True
 
-      # Flash/wait period
-      time.sleep(0.5)
+  def tuning(self):
+    self.state="tuning"
 
-      # Turn off the light when the timer expires
-      if self.timer:
-        self.timer -= 0.5
+  def playing(self):
+    self.state="playing"
 
-        if self.timer <= 0:
-          self.timer = None
-          if self.colour_0_mem:
-            self.colour_0 = self.colour_0_mem;
-            self.colour_0_mem = None;
-          else:
-            self.colour_0 = "OFF"
+  def paused(self):
+    self.state="paused"
 
-          if self.colour_1_mem:
-            self.colour_1 = self.colour_1_mem;
-            self.colour_1_mem = None;
-          else:
-            self.colour_1 = "OFF"
-
-if __name__ == "__main__":
-  led = RGB_LED(1, "LED")
-  led.start()
-
-  try:
-    while True:
-      led.set_blink("YELLOW", "BLUE")
-      time.sleep(5)
-
-      for colour in COLOURS:
-        led.set_static(colour)
-        time.sleep(0.5)
-
-  except:
-    GPIO.cleanup()
-    exit()
+if __name__=="__main__":
+  leds=RGBLeds()
+  for line in sys.stdin:
+    x=line.strip().split()
+    if len(x)==1:
+      getattr(leds, x[0])()
+    elif len(x)==2:
+      getattr(leds, x[0])(int(x[1]))
+    else:
+      print("error in arguments:",x)

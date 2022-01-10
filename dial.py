@@ -1,42 +1,47 @@
 #! /usr/bin/python3
 import time
-import threading
-import RPi.GPIO as GPIO
+import queue
+import gpiozero
+#import RPi.GPIO as GPIO
+from threading import Thread
 
-class Dial (threading.Thread):
-  def __init__(self, threadID, name):
-    threading.Thread.__init__(self)
-    self.threadID = threadID
-    self.name = name
+DIALS = [
+  ("right_jog", 16, 25), 
+  ("left_jog", 24, 23)
+]
 
-    # BCM pin numbering!
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup([17, 18], direction=GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    self.direction = 0
+def Dial(q,name,p1,p2):
+  gz=gpiozero.RotaryEncoder(p1,p2)
+  gz.when_rotated_clockwise=lambda:q.put((name,1))
+  gz.when_rotated_counter_clockwise=lambda:q.put((name,-1))
+  return gz
 
-  def __del__(self):
-    GPIO.cleanup()
+# class Dial(Thread):
+#   def __init__(self, q, name, pin1, pin2):
+#     Thread.__init__(self)
+#     self.daemon = True
+#     self.q = q
+#     self.name = name
+#     self.pin1 = pin1
+#     self.pin2 = pin2
+#     GPIO.setmode(GPIO.BCM)
+#     GPIO.setup([self.pin1, self.pin2], direction=GPIO.IN, pull_up_down=GPIO.PUD_UP)
+#     self.start()
 
-  def get_direction(self):
-    # Pickup the direction and zero it, so we only get it once
-    return_val = self.direction
-    self.direction = 0
-    return return_val
+#   def run(self):
+#     while True:
+#       GPIO.wait_for_edge(self.pin1, GPIO.FALLING)
+#       v=GPIO.input(self.pin2)
+#       self.q.put((self.name,v*2-1))
+#       GPIO.wait_for_edge(self.pin2, GPIO.BOTH)
+#       GPIO.wait_for_edge(self.pin1, GPIO.RISING)
 
-  def run(self):
-    while True:
-      # We only need to check for an interrupt on one pin
-      # because we can simply test the value of the other to
-      # work out which direction the dial was turned.
-      # We cannot modify the global direction variable because
-      # it is processed afterwards, so it would not be thread safe
-      GPIO.wait_for_edge(17, GPIO.FALLING)
-      new_direction = GPIO.input(18)
-      if not new_direction:
-        new_direction = -1
-
-      # Save the new_direction
-      self.direction = new_direction
-
-      # Debounce period
-      time.sleep(0.3)
+class Dials():
+  def __init__(self, q = queue.Queue()):
+    self.q = q
+    self.dials = [Dial(self.q,name,pin1,pin2) for name,pin1,pin2 in DIALS]
+  
+if __name__=="__main__":
+  d=Dials()
+  while True:
+    print(d.q.get())
